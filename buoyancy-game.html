@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset='utf-8'>
+    <title>中性浮力ゲーム</title>
+    <script src="https://cdn.jsdelivr.net/processing.js/1.4.8/processing.min.js"></script>
+    <style>
+      html,body
+      {
+          width: 100%;
+          height: 100%;
+          margin:0px;
+          padding: 0px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- <h1>中性浮力ゲーム</h1> -->
+    <br/>
+    <form name="form1">
+      <input type="checkbox" name="show_meters" checked value="show_meters">
+      速度・加速度メーターを表示する
+    </form>
+    <br/>
+    <div style="font-size:70%">Icons made by <a href="https://www.flaticon.com/authors/freepik" title="Freepik">Freepik</a> from <a href="https://www.flaticon.com/" title="Flaticon">www.flaticon.com</a></div>
+    <canvas id="canvas"></canvas>
+    <script type="application/javascript">
+      // Auxiliary functions
+      function max (a,b) {
+          return a > b ? a : b;
+      }
+      function min (a,b) {
+          return a < b ? a : b;
+      }
+      function clip (l,h,x) {
+          return max (l, min (x, h))
+      }
+      function StopWatch (start_time = null) {
+          this.start = start_time ? start_time : new Date ()
+          this.last_lap = this.start
+          this.lap = () => {
+              const last_lap = this.last_lap
+              this.last_lap = new Date ()
+              return (this.last_lap - last_lap) / 1000.0
+          }
+          this.total = () => {
+              return (new Date () - this.start) / 1000.0
+          }
+      }
+      function StopCounter (start_count = 0) {
+          this.start = start_count
+          this.last_lap = this.start
+          this.counter = this.start
+          this.add = (c) => {
+              this.counter += c
+              return this.counter
+          }
+          this.peek_lap = () => { return this.counter - this.last_lap }
+          this.lap = () => {
+              const last_lap = this.last_lap
+              this.last_lap = this.counter
+              return this.counter - last_lap
+          }
+          this.total = () => { return this.counter }
+      }
+
+      // Configurable constants
+
+      var g = 9.8          // Gravitational acceleration [m/s^2]
+      var w = 1.0          // Water density [kg/L]
+      var pool_depth = 5.0 // [m]
+      
+      // Since the diver is horizontal, width is the length from head
+      // to ankles, and height is the length from stomach to cylinder.
+      var diver_width = 1.7        // [m]
+      var diver_height = 0.50      // [m]
+      var diver_frontal_area = 0.6 // [m^2]
+
+      // Data from https://www.quora.com/What-is-the-density-of-the-human-body-What-marginal-change-in-density-is-caused-by-expansion-of-lungs-due-to-breathing
+      // http://ajcn.nutrition.org/content/20/4/305.full.pdf
+      var diver_density = 1.04 // [kg/L]
+
+      var diver_mass = 65.0     // [kg]
+      var equipment_mass = 20.0 // [kg]
+      var air_mass = 5.0        // Mass of air in cylinder [kg]
+
+      var minL = 3.6  // Volume of lungs at max exhalation [L]
+      var maxL = 6.0  // Volume of full lungs [L]
+      var minB = 2.0  // Volume of empty BCD [L]
+      var maxB = 10.0 // Volume of full BCD [L]
+      var VC0 = 1.0   // Volume of other compressible matter at depth 0 [L]
+      var VI = diver_mass / diver_density // Incompressible Volume [L]
+
+      var vital_cap = maxL - minL             // [L]
+      var breath_time = 8.5                   // [s]
+      var maxIL = vital_cap / breath_time     // Inhalation rate [L/s]
+      var BCD_cap = maxB - minB               // [L]
+      var pump_time = 10.0                    // [s]
+      var maxIB = BCD_cap / pump_time // BCD inflation rate [L/s]
+
+      // Weight calibration
+      var calib_depth = diver_width * 0.4 // Just underwater in
+                                          // upright posture
+      var calib_bcd   = minB
+      var calib_lungs = (maxL + minL) / 2
+      var weights_mass // [kg]
+      var m  // Total mass [kg]
+
+      const debug = true
+
+      // Indices into the state vector y.
+      const id  = 0 // Depth [m]
+      const idp = 1 // Derivative of depth [m/s]
+      const iVL = 2 // Volume of lung [L]
+      const iVB = 3 // Volume of BCD [L]
+      const iVC = 4 // Volume of other compressible material
+      const y_len = 5
+
+      // Input variables
+      var IL = 0.0 // Current inhalation rate [L/s]
+      var IB = 0.0 // Current BCD inflation rate [L/s]
+      var paused = false
+
+      // Initial values
+      var y0 = new Array (y_len)
+      y0[id]  = 0.0 // surface
+      y0[idp] = 0.0 // at rest
+      y0[iVL] = maxL // lungs full
+      y0[iVB] = maxB // BCD full
+      y0[iVC] = VC0
+
+      var t = null
+      var y = []
+      var yp = []
+      var frame_count = 0
+      var step_count = 0
+
+      // Simulation statistics
+      const target_fps = 60 // [Frames / s]
+      // Simulation steps per frame.
+      const max_spf = 1000 * 1000 / target_fps
+      var spf
+      var fps
+      var sps // Extrapolated max simulation steps per second.
+      var last_stat_update_time
+      // For FPS calculations.  Reset on every stat update.
+      var frame_count
+      var step_count
+      var compute_time
+
+      function submerged (d) {
+          return clip (0.0, 1.0, 0.5 + d / diver_height)
+      }
+
+      function buoyancy (d, VL, VB) {
+          const P = 1 + d / 10
+          const VC = VC0 / P
+          return w * g * (VL + VB + VC + VI) * submerged (d)
+      }
+
+      function potential_energy (d, VL, VB) {
+          const P = 1 + d / 10
+          const VC = VC0 / P
+          const V = VL + VB + VC
+          return 10*V*w * Math.log (d/10 + 1) - m*g*d
+      }
+
+      function drag (d, dp) {
+          // The article at
+          // https://rmets.onlinelibrary.wiley.com/doi/pdf/10.1256/wea.29.02
+          // roughly estimates a drag coefficient of 0.6 in the air.
+          // Applying this resulted in unrealistically light drag.
+
+          // The article at
+          // https://aapt.scitation.org/doi/10.1119/1.12513 states
+          // that in highly turbulent flow (Re ~ 1e6), drag
+          // coefficient is expected to be roughly constant
+          // (apparently this is a well-known rule of thumb).  This
+          // article also offers a drag coefficient in the same
+          // ballpark as the one above, but this is when the person is
+          // in the prone position (i.e. towed head-first).
+
+          // https://pdfs.semanticscholar.org/ecd0/45769946bbf497e15f319c933869806dfaf9.pdf
+          // gives a drag coefficient of about 0.7-0.8 for the prone
+          // position.
+          const drag_coef = 0.8 // 0.6
+          return (-1/2.0) * drag_coef * diver_frontal_area * Math.abs (dp) * dp * w
+      }
+
+      function calibrate_weights () {
+          m = buoyancy (calib_depth, calib_lungs, calib_bcd) / g
+          weights_mass = m - (diver_mass + equipment_mass + air_mass)
+          if (debug) {
+              console.log ('Set weights to ' + weights_mass.toFixed(1) + ' [kg]')
+          }
+
+          y0[id] = calib_depth
+          y0[iVL] = calib_lungs
+          y0[iVB] = calib_bcd
+      }
+
+      function reset () {
+          calibrate_weights ()
+          t = new Date ()
+          y = y0.slice ()
+          yp = y0.slice ()
+          fps = 0
+          spf = 100
+          sps = 0
+          stat_time = new StopWatch ()
+          compute_time = new StopCounter () // NB: not StopWatch
+          frame_count = new StopCounter ()
+          step_count = new StopCounter ()
+      }
+      
+      reset ()
+
+      function simulate () {
+          if (paused)
+              return
+
+          // A simple forward Euler method with step size adaptation.
+          var last_t = t
+          var now = new Date ()
+          var delta_t = (now - last_t) / 1000.0
+          const start_time = now
+
+          dt = delta_t / spf // Step size.
+
+          for (i = 0; i < spf; ++i) {
+              // Calculate y'.  The ODE is as follows.  FIXME: add drag.
+              // d'' = g - (wg / m)(V_L + V_B + V_C)
+              // V_L' = - V_L (d' / (10 + d)) + I_L
+              // V_B' = - V_B (d' / (10 + d)) + I_B
+              // V_C' = - V_C (d' / (10 + d))
+              d = y[id]
+              dp = y[idp]
+              VL = y[iVL]
+              VB = y[iVB]
+              VC = y[iVC]
+
+              // P' / P, where P is water pressure
+              if (d >= 0)
+                  compression_rate = dp / (10 + d)
+              else
+                  compression_rate = 0
+
+              // Equation of motion
+
+              // Assume that diver breath and BCD pump are
+              // vigorous enough to compensate for changes in
+              // water pressure.
+              yp[id] = dp
+              yp[idp] = g - buoyancy (d, VL, VB) / m + drag (d, dp)
+              if (Math.abs (IL) > 0.0001) {
+                  yp[iVL] = IL
+              }
+              else {
+                  yp[iVL] = - VL * compression_rate
+              }
+              if (Math.abs (IB) > 0.0001) {
+                  yp[iVB] = IB
+              }
+              else {
+                  yp[iVB] = - VB * compression_rate
+              }
+              // Alternative version that assumes diaphragm and BCD
+              // pump have to fight pressure changes.
+              // yp[iVL] = - VL * compression_rate + IL
+              // yp[iVB] = - VB * compression_rate + IB
+              yp[iVC] = - VC * compression_rate
+
+              // Now update y.
+              for (j = 0; j < y.length; j++)
+                  y[j] += yp[j] * dt
+
+              y[iVL] = clip (minL, maxL, y[iVL])
+              y[iVB] = clip (minB, maxB, y[iVB])
+
+              // Bounce off the bottom of the pool.
+              if (y[id] > pool_depth - diver_height / 2) {
+                  y[id] = pool_depth - diver_height / 2
+                  y[idp] = - 0.2 * y[idp]
+              }
+          }
+
+          t = now
+
+          const end_time = new Date ()
+          const sim_dt = (end_time - start_time) / 1000
+
+          // Update FPS info
+          frame_count.add (1)
+          step_count.add (spf)
+          compute_time.add (sim_dt)
+          if (frame_count.peek_lap () >= target_fps / 4) {
+              sps = step_count.lap () / compute_time.lap ()
+              fps = frame_count.lap () / stat_time.lap ()
+
+              // Try to steer the FPS to target_fps, but stay within
+              // 1% of the device's computing capacity.
+              spf = clip (1, 100, sps / target_fps / 100)
+          }
+      }
+
+      function check_inputs () {
+          const up_pressed = is_key_down (KEY_UP)
+          const down_pressed = is_key_down (KEY_DOWN)
+          if (up_pressed && ! down_pressed)
+              IL = maxIL
+          else if (down_pressed && ! up_pressed)
+              IL = - maxIL
+          else
+              IL = 0.0
+
+          const inflate_pressed = is_key_down (KEY_INFLATE)
+          const deflate_pressed = is_key_down (KEY_DEFLATE)
+          if (inflate_pressed && ! deflate_pressed)
+              IB = maxIB
+          else if (deflate_pressed && ! inflate_pressed)
+              IB = - maxIB
+          else
+              IB = 0.0
+      }
+
+      // Drawing-related data
+
+      var canvas = document.getElementById("canvas");
+      // attaching the sketchProc function to the canvas
+      var processingInstance = new Processing(canvas, sketchProc);
+      processingInstance.frameRate (target_fps)
+
+      var pool_disp_x
+      var pool_disp_y
+      var pool_disp_width
+      var pool_disp_height
+      var px_per_m // pixels per meter
+
+      const diver_img = processingInstance.loadImage ('diver.png')
+
+      function sketchProc(processing) {
+          // Override draw function, by default it will be called 60 times per second
+          processing.draw = function() {
+              check_inputs ()
+              simulate ()
+
+              // Erase background
+              processing.background(224, 225, 225);
+
+              // Draw pool
+              processing.fill (28, 120, 186)
+              processing.rect (pool_disp_x, pool_disp_y,
+                               pool_disp_width, pool_disp_height)
+
+              // Draw lung gauge
+              const lung_x = processing.width * 0.7
+              const lung_y = processing.height * 0.1
+              const lung_w = max (20, processing.width * 0.1)
+              const lung_h = processing.height * 0.8
+              processing.fill (255)
+              processing.rect (lung_x, lung_y, lung_w, lung_h)
+              const lung_filled = clip (0, 1, (y[iVL] - minL) / (maxL - minL))
+              const lung_filled_h = lung_h * lung_filled
+              processing.fill (30, 184, 71)
+              processing.rect (lung_x, lung_y + lung_h - lung_filled_h,
+                               lung_w, lung_filled_h)
+
+              // Draw BCD gauge
+              const bcd_x = processing.width * 0.2
+              const bcd_y = processing.height * 0.1
+              const bcd_w = max (20, processing.width * 0.1)
+              const bcd_h = processing.height * 0.8
+              processing.fill (255)
+              processing.rect (bcd_x, bcd_y, bcd_w, bcd_h)
+              const bcd_filled = clip (0, 1, (y[iVB] - minB) / (maxB - minB))
+              const bcd_filled_h = bcd_h * bcd_filled
+              processing.fill (184, 30, 71)
+              processing.rect (bcd_x, bcd_y + bcd_h - bcd_filled_h,
+                               bcd_w, bcd_filled_h)
+
+              if (document.form1.show_meters.checked) {
+                  // Draw speedometer
+                  const speed_x = processing.width * 0.03
+                  const speed_y = processing.height * 0.53
+                  const speed_w = max (6, processing.width * 0.05)
+                  processing.fill (184, 71, 30)
+                  processing.line (speed_x, speed_y, speed_x + speed_w, speed_y)
+                  processing.triangle (speed_x, speed_y,
+                                       speed_x + speed_w / 2, speed_y + y[idp] * px_per_m,
+                                       speed_x + speed_w, speed_y)
+
+                  // Draw accelerometer
+                  const accel_x = speed_x + speed_w + min (5, processing.width * 0.01)
+                  const accel_y = processing.height * 0.53
+                  const accel_w = speed_w
+                  processing.fill (184, 71, 30)
+                  processing.line (accel_x, accel_y, accel_x + accel_w, accel_y)
+                  processing.triangle (accel_x, accel_y,
+                                       accel_x + accel_w / 2, accel_y + yp[idp] * px_per_m,
+                                       accel_x + accel_w, accel_y)
+              }
+
+              // Draw diver
+              processing.fill (255, 255, 255)
+              const diver_disp_width = diver_width * px_per_m
+              const diver_disp_height = diver_disp_width * diver_img.height / diver_img.width
+              if (true) {
+                  processing.image (diver_img,
+                                    processing.width / 2 - diver_disp_width / 2,
+                                    pool_disp_y + y[id] * px_per_m - diver_disp_height * 0.55,
+                                    diver_disp_width,
+                                    diver_disp_height)
+              }
+              else {
+                  processing.ellipse (processing.width / 2,
+                                      pool_disp_y + y[id] * px_per_m,
+                                      diver_width * px_per_m,
+                                      diver_height * px_per_m);
+              }
+
+              // Show statistics
+              processing.fill (255)
+              processing.text ('FPS: ' + fps.toFixed (1)
+                               + '\nSPF: ' + spf.toFixed (1),
+                               10, 10)
+
+              if (debug) {
+                  processing.text ('lung: ' + y[iVL].toFixed (1) + ' [L]'
+                                   + '\nΔlung: ' + IL + ' [L/s]'
+                                   + '\nBCD: ' + y[iVB].toFixed (1) + ' [L]'
+                                   + '\nΔBCD: ' + IB + ' [L/s]'
+                                   + '\ndepth: ' + y[id].toFixed (2) + ' [m]'
+                                   + '\npressure: ' + (1 + y[id]/10).toFixed (1) + ' [atm]'
+                                   + '\nmass: ' + m.toFixed(1) + ' [kg]'
+                                   + '\nvolume: ' + (y[iVL] + y[iVB] + y[iVC] + VI).toFixed(1) + ' [L]'
+                                   + '\nbuoyancy: ' + buoyancy (y[id], y[iVL], y[iVB]).toFixed(1) + ' [N]'
+                                   + '\ngravity: ' + (m * g).toFixed(1) + ' [N]'
+                                   + '\nenergy: ' + (potential_energy (d, VL, VB) + 1/2 * m * y[idp] * y[idp]).toFixed(1) + ' [N]'
+                                   + '\nIL: ' + IL.toFixed(1) + ' [L/s]'
+                                   ,
+                                   10,
+                                   100)
+                  if (paused) {
+                      processing.text ('PAUSE', processing.width / 2 - 50,
+                                       processing.height * 0.1)
+                  }
+              }
+          };
+      }
+
+      document.body.style.overflow = 'hidden';
+
+      function resize () {
+          canvas.width = document.body.clientWidth;
+          canvas.height = document.body.clientHeight * 0.9;
+          processingInstance.width = canvas.width;
+          processingInstance.height = canvas.height;
+
+          pool_disp_width = canvas.width
+          pool_disp_height = canvas.height * 0.8
+          pool_disp_x = 0
+          pool_disp_y = canvas.height - pool_disp_height
+          px_per_m = pool_disp_height / pool_depth
+      }
+
+      resize ()
+      window.onresize = resize
+
+      var KEY_UP = 38      // up-arrow
+      var KEY_DOWN = 40    // down-arrow
+      var KEY_INFLATE = 65 // A
+      var KEY_PAUSE = 80  // P
+      var KEY_DEFLATE = 90 // Z
+      var key_states = {}
+
+      document.onkeydown = function (e) {
+          key_states[e.keyCode] = true
+          if (e.keyCode == KEY_PAUSE)
+              paused = ! paused
+          // console.log ('DOWN: keyCode =', e.keyCode)
+      }
+
+      document.onkeyup = function (e) {
+          // console.log ('UP: keyCode =', e.keyCode)
+          delete key_states[e.keyCode]
+      }
+
+      function is_key_down (key_code) {
+          return key_states[key_code]
+      }
+    </script>
+  </body>
+</html>
